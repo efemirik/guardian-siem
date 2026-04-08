@@ -1,0 +1,38 @@
+services:
+  # 1. Persistent Storage Layer: Core database for processed log retention.
+  postgres:
+    image: postgres:15-alpine
+    container_name: siem_postgres
+    environment:
+      POSTGRES_USER: siem_user
+      POSTGRES_PASSWORD: siem_password
+      POSTGRES_DB: siem_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # 2. In-Memory Cache Layer: Used by the rule engine for high-speed rate limiting and state tracking.
+  redis:
+    image: redis:7-alpine
+    container_name: siem_redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # 3. Message Broker Layer: Buffers incoming high-throughput logs before processing to prevent data loss.
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: siem_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: siem_user
+      RABBITMQ_DEFAULT_PASS: siem_password
+    ports:
+      - "5672:5672"   # Main AMQP port for the Go ingestion API
+      - "15672:15672" # Management UI for monitoring queue health and throughput
+    restart: unless-stopped
+
+volumes:
+  # Persists PostgreSQL data across container lifecycle events.
+  pgdata:
