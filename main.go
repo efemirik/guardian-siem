@@ -24,7 +24,7 @@ var queue amqp.Queue
 // In a production environment, this should include retry mechanisms.
 func initRabbitMQ() {
 	// Connect to the RabbitMQ container we started via docker-compose
-	conn, err := amqp.Dial("amqp://siem_user:siem_password@localhost:5672/")
+	conn, err := amqp.Dial("amqp://siem_user:siem_password@siem_rabbitmq:5672/")
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
 	}

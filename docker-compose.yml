@@ -1,6 +1,8 @@
+version: '3.8'
+
 services:
-  # 1. Persistent Storage Layer: Core database for processed log retention.
-  postgres:
+  # 1. Database for persistent log storage
+  siem_postgres:
     image: postgres:15-alpine
     container_name: siem_postgres
     environment:
@@ -10,29 +12,60 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
-    restart: unless-stopped
+      - guardian-siem_pgdata:/var/lib/postgresql/data
 
-  # 2. In-Memory Cache Layer: Used by the rule engine for high-speed rate limiting and state tracking.
-  redis:
+  # 2. In-memory store for real-time rule engine counters
+  siem_redis:
     image: redis:7-alpine
     container_name: siem_redis
     ports:
       - "6379:6379"
-    restart: unless-stopped
 
-  # 3. Message Broker Layer: Buffers incoming high-throughput logs before processing to prevent data loss.
-  rabbitmq:
+  # 3. Message Broker for asynchronous log processing
+  siem_rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: siem_rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: siem_user
       RABBITMQ_DEFAULT_PASS: siem_password
     ports:
-      - "5672:5672"   # Main AMQP port for the Go ingestion API
-      - "15672:15672" # Management UI for monitoring queue health and throughput
-    restart: unless-stopped
+      - "5672:5672"
+      - "15672:15672"
+
+  # 4. High-throughput log ingestion API (Main Entrance)
+  siem_api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: siem_api
+    ports:
+      - "8080:8080"
+    depends_on:
+      - siem_rabbitmq
+    restart: on-failure
+
+  # 5. Cybersecurity Rule Engine (Asynchronous Worker)
+  siem_worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: siem_worker
+    depends_on:
+      - siem_rabbitmq
+      - siem_redis
+    restart: on-failure
+
+  # 6. Real-time Monitoring Command Center (HTMX Powered)
+  siem_admin:
+    build:
+      context: .
+      dockerfile: admin/Dockerfile
+    container_name: siem_admin
+    ports:
+      - "3000:3000"
+    depends_on:
+      - siem_redis
+    restart: on-failure
 
 volumes:
-  # Persists PostgreSQL data across container lifecycle events.
-  pgdata:
+  guardian-siem_pgdata:

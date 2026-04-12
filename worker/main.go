@@ -22,13 +22,14 @@ var ctx = context.Background()
 func main() {
 	// 1. Connect to Redis (In-Memory Cache for fast counting)
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "", // No password set in docker-compose
+		Addr:     "siem_redis:6379",
+		Password: "", 
 		DB:       0,
 	})
 
+	
 	// 2. Connect to RabbitMQ (Message Broker)
-	conn, err := amqp.Dial("amqp://siem_user:siem_password@localhost:5672/")
+	conn, err := amqp.Dial("amqp://siem_user:siem_password@siem_rabbitmq:5672/")
 	if err != nil {
 		log.Fatalf("RabbitMQ connection failed: %v", err)
 	}
