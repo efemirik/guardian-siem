@@ -5,60 +5,93 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv" // Sayısal dönüşüm için eklendi!
+	"sync"
+	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/websocket"
 )
 
-var ctx = context.Background()
-var rdb *redis.Client
+var (
+	ctx      = context.Background()
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	clients = make(map[*websocket.Conn]bool)
+	mutex   = sync.Mutex{}
+)
 
-func init() {
-	// Docker ağındaki Redis'e bağlan
-	rdb = redis.NewClient(&redis.Options{
-		Addr:     "siem_redis:6379",
-		Password: "", 
-		DB:       0,
-	})
-}
-
-func homeHandler(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, "index.html")
-}
-
-func alarmsHandler(w http.ResponseWriter, r *http.Request) {
-	keys, err := rdb.Keys(ctx, "bruteforce_attempts:*").Result()
-	if err != nil || len(keys) == 0 {
-		fmt.Fprintf(w, "<p class='text-green-400'>✅ All systems clear. No attacks detected.</p>")
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
+	defer ws.Close()
 
-	htmlResponse := ""
-	for _, key := range keys {
-		attempts, _ := rdb.Get(ctx, key).Result()
-		ip := key[len("bruteforce_attempts:"):] 
-		
-		htmlResponse += fmt.Sprintf(`
-			<div class="bg-red-900/50 border-l-4 border-red-500 p-4 rounded flex justify-between items-center">
-				<div>
-					<p class="text-red-400 font-bold">🚨 BRUTE-FORCE DETECTED</p>
-					<p class="text-sm text-gray-300">Target IP: <span class="text-white font-mono">%s</span></p>
-				</div>
-				<div class="text-right">
-					<p class="text-2xl font-bold text-red-500">%s</p>
-					<p class="text-xs text-gray-400">Failed Attempts</p>
-				</div>
-			</div>
-		`, ip, attempts)
+	mutex.Lock()
+	clients[ws] = true
+	mutex.Unlock()
+
+	for {
+		if _, _, err := ws.ReadMessage(); err != nil {
+			mutex.Lock()
+			delete(clients, ws)
+			mutex.Unlock()
+			break
+		}
 	}
-	w.Write([]byte(htmlResponse))
+}
+
+func broadcastAlarms(rdb *redis.Client) {
+	for {
+		keys, _ := rdb.Keys(ctx, "bruteforce_attempts:*").Result()
+		var alarms []map[string]string
+
+		for _, key := range keys {
+			countStr, err := rdb.Get(ctx, key).Result()
+			if err == nil {
+				// Metni gerçek bir matematiksel tam sayıya (Integer) çevir
+				count, _ := strconv.Atoi(countStr)
+				
+				// Artık gerçek matematiksel büyüklük kontrolü yapıyor!
+				if count >= 5 {
+					ip := key[20:]
+					alarms = append(alarms, map[string]string{
+						"ip":    ip,
+						"count": countStr,
+					})
+				}
+			}
+		}
+
+		if len(alarms) > 0 {
+			mutex.Lock()
+			for client := range clients {
+				err := client.WriteJSON(alarms)
+				if err != nil {
+					client.Close()
+					delete(clients, client)
+				}
+			}
+			mutex.Unlock()
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func main() {
-	http.HandleFunc("/", homeHandler)
-	http.HandleFunc("/alarms", alarmsHandler)
+	rdb := redis.NewClient(&redis.Options{Addr: "siem_redis:6379"})
+	go broadcastAlarms(rdb)
 
-	log.Println("🖥️ Admin UI is running on port 3000")
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "index.html")
+	})
+	http.HandleFunc("/ws", handleConnections)
+
+	fmt.Println("🚀 Guardian SIEM Admin Dashboard started on :3000")
 	if err := http.ListenAndServe(":3000", nil); err != nil {
-		log.Fatalf("Server failed to start: %v", err)
+		log.Fatal(err)
 	}
 }

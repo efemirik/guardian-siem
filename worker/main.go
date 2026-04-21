@@ -2,122 +2,135 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/jackc/pgx/v4"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type LogPayload struct {
+var ctx = context.Background()
+
+// LogEntry matches the extended structure sent by the API
+type LogEntry struct {
 	IPAddress   string `json:"ip_address"`
 	EventType   string `json:"event_type"`
 	Description string `json:"description"`
+	UserAgent   string `json:"user_agent"`
+	HTTPMethod  string `json:"http_method"`
 }
 
-var ctx = context.Background()
-var db *sql.DB
-
-// initPostgres connects to the database and creates the alerts table if it doesn't exist
-func initPostgres() {
-	var err error
-	// Docker ağındaki Postgres'e bağlanıyoruz
-	connStr := "host=siem_postgres port=5432 user=siem_user password=siem_password dbname=siem_db sslmode=disable"
-	
-	// Bağlantı için birkaç saniye bekle (Veritabanının tam uyanması için)
-	for i := 0; i < 5; i++ {
-		db, err = sql.Open("postgres", connStr)
-		if err == nil && db.Ping() == nil {
-			break
-		}
-		log.Println("Postgres bekleniyor...")
-		time.Sleep(2 * time.Second)
-	}
-
+func failOnError(err error, msg string) {
 	if err != nil {
-		log.Fatalf("PostgreSQL connection failed: %v", err)
+		log.Panicf("%s: %s", msg, err)
 	}
-
-	// Tabloyu oluştur (Eğer yoksa)
-	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS alerts (
-		id SERIAL PRIMARY KEY,
-		ip_address VARCHAR(50) NOT NULL,
-		event_type VARCHAR(50) NOT NULL,
-		attempt_count INT NOT NULL,
-		detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);`
-	
-	_, err = db.Exec(createTableSQL)
-	if err != nil {
-		log.Fatalf("Failed to create alerts table: %v", err)
-	}
-	log.Println("📦 PostgreSQL connection established and table is ready.")
 }
 
 func main() {
-	// 1. Veritabanını Başlat
-	initPostgres()
-	defer db.Close()
-
-	// 2. Redis'e Bağlan
+	// 1. Connect to Redis (For counters and blacklists)
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "siem_redis:6379",
-		Password: "",
-		DB:       0,
+		Addr: "siem_redis:6379",
 	})
 
-	// 3. RabbitMQ'ya Bağlan
-	conn, err := amqp.Dial("amqp://siem_user:siem_password@siem_rabbitmq:5672/")
-	if err != nil {
-		log.Fatalf("RabbitMQ connection failed: %v", err)
+	// 2. Connect to PostgreSQL (For persistent alerts)
+	dbURL := "postgres://siem_user:SecretPassword123!@siem_postgres:5432/siem_db"
+	var db *pgx.Conn
+	var err error
+	for i := 0; i < 15; i++ {
+		db, err = pgx.Connect(ctx, dbURL)
+		if err == nil {
+			break
+		}
+		log.Printf("Waiting for PostgreSQL... (%d/15)", i+1)
+		time.Sleep(5 * time.Second)
 	}
+	failOnError(err, "Failed to connect to PostgreSQL")
+	defer db.Close(ctx)
+
+	// 3. Connect to RabbitMQ (For message queueing)
+	var conn *amqp.Connection
+	for i := 0; i < 15; i++ {
+		conn, err = amqp.Dial("amqp://guest:guest@siem_rabbitmq:5672/")
+		if err == nil {
+			break
+		}
+		log.Printf("Waiting for RabbitMQ... (%d/15)", i+1)
+		time.Sleep(5 * time.Second)
+	}
+	failOnError(err, "Failed to connect to RabbitMQ")
 	defer conn.Close()
 
 	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatalf("Channel creation failed: %v", err)
-	}
+	failOnError(err, "Failed to open a channel")
 	defer ch.Close()
 
-	// 4. Kuyruktan Dinlemeye Başla
-	msgs, err := ch.Consume("siem_logs_queue", "", true, false, false, false, nil)
-	if err != nil {
-		log.Fatalf("Failed to register a consumer: %v", err)
-	}
+	q, err := ch.QueueDeclare(
+		"security_logs", // name
+		false,           // durable
+		false,           // delete when unused
+		false,           // exclusive
+		false,           // no-wait
+		nil,             // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
 
-	log.Println("🛡️ SIEM Worker is running. Waiting for logs...")
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	failOnError(err, "Failed to register a consumer")
 
+	log.Println("🛡️ SIEM Worker is active. Waiting for logs...")
+
+	// 4. Main loop to process messages continuously
 	for d := range msgs {
-		var payload LogPayload
-		if err := json.Unmarshal(d.Body, &payload); err != nil {
+		var logEntry LogEntry
+		err := json.Unmarshal(d.Body, &logEntry)
+		if err != nil {
+			log.Printf("Error decoding JSON: %v", err)
 			continue
 		}
 
-		if payload.EventType == "failed_login" {
-			redisKey := "bruteforce_attempts:" + payload.IPAddress
+		// Increment attempt counter in Redis
+		redisKey := fmt.Sprintf("bruteforce_attempts:%s", logEntry.IPAddress)
+		count, err := rdb.Incr(ctx, redisKey).Result()
+		if err != nil {
+			log.Printf("Redis error: %v", err)
+			continue
+		}
+
+		// Set expiration for 60 seconds on the first attempt
+		if count == 1 {
+			rdb.Expire(ctx, redisKey, 60*time.Second)
+		}
+
+		// Threshold check (Trigger Defense & Logging)
+		if count >= 5 {
+			// Insert alert into PostgreSQL (with forensics)
+			query := `INSERT INTO alerts (ip_address, event_type, attempt_count, user_agent, http_method) VALUES ($1, $2, $3, $4, $5)`
+			_, err = db.Exec(ctx, query, logEntry.IPAddress, "BRUTE_FORCE", count, logEntry.UserAgent, logEntry.HTTPMethod)
 			
-			attempts, _ := rdb.Incr(ctx, redisKey).Result()
-			
-			if attempts == 1 {
-				rdb.Expire(ctx, redisKey, 60*time.Second)
+			if err != nil {
+				log.Printf("DB Error: %v", err)
+			} else {
+				log.Printf("🚨 ALERT: Brute force from %s saved to DB.", logEntry.IPAddress)
 			}
 
-			// ALARM DURUMU: 5'i geçerse
-			if attempts == 5 { // Sadece 5 olduğunda yaz, her seferinde tekrar tekrar yazmasın
-				log.Printf("🚨 ALARM [BRUTE-FORCE DETECTED]: IP %s has failed %d times!", payload.IPAddress, attempts)
-				
-				// --- POSTGRESQL'E KAYDET (KALICI HAFIZA) ---
-				insertSQL := `INSERT INTO alerts (ip_address, event_type, attempt_count) VALUES ($1, $2, $3)`
-				_, err := db.Exec(insertSQL, payload.IPAddress, "BRUTE_FORCE", attempts)
-				if err != nil {
-					log.Printf("❌ Failed to save alert to DB: %v", err)
-				} else {
-					log.Printf("💾 Alert successfully saved to PostgreSQL for Forensic Analysis.")
-				}
+			// Auto-Ban logic: Block IP for 10 minutes
+			blacklistKey := fmt.Sprintf("blacklist:%s", logEntry.IPAddress)
+			err = rdb.Set(ctx, blacklistKey, "blocked", 10*time.Minute).Err()
+			if err != nil {
+				log.Printf("Blacklist Error: %v", err)
+			} else {
+				log.Printf("⛔ DEFENSE: Banned IP %s for 10 minutes.", logEntry.IPAddress)
 			}
 		}
 	}

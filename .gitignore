@@ -1,0 +1,1 @@
+echo "api_server`nworker_app`nadmin_ui`n.env`n*.exe" > .gitignore
